@@ -32,32 +32,37 @@
 
 package com.android.bluetooth.pbap;
 
-import com.android.bluetooth.R;
-
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
-import android.content.Intent;
-import android.content.res.Resources;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothPbap;
-import android.bluetooth.BluetoothSocket;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothServerSocket;
+import android.bluetooth.BluetoothSocket;
+import android.bluetooth.IBluetooth;
 import android.bluetooth.IBluetoothPbap;
+import android.bluetooth.BluetoothUuid;
+import android.content.Context;
+import android.content.Intent;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.PowerManager;
-import android.provider.ContactsContract.RawContacts;
+import android.os.RemoteException;
+import android.os.ServiceManager;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.util.Log;
+import com.android.bluetooth.Utils;
+
+
+import com.android.bluetooth.R;
+import com.android.bluetooth.btservice.AdapterService;
 
 import java.io.IOException;
-import java.util.ArrayList;
 
 import javax.obex.ServerSession;
 
@@ -71,28 +76,9 @@ public class BluetoothPbapService extends Service {
      * DEBUG log: "setprop log.tag.BluetoothPbapService VERBOSE"
      */
 
-    public static final boolean DEBUG = false;
+    public static final boolean DEBUG = true;
 
     public static final boolean VERBOSE = false;
-
-    /**
-     * Intent indicating incoming connection request which is sent to
-     * BluetoothPbapActivity
-     */
-    public static final String ACCESS_REQUEST_ACTION = "com.android.bluetooth.pbap.accessrequest";
-
-    /**
-     * Intent indicating incoming connection request accepted by user which is
-     * sent from BluetoothPbapActivity
-     */
-    public static final String ACCESS_ALLOWED_ACTION = "com.android.bluetooth.pbap.accessallowed";
-
-    /**
-     * Intent indicating incoming connection request denied by user which is
-     * sent from BluetoothPbapActivity
-     */
-    public static final String ACCESS_DISALLOWED_ACTION =
-            "com.android.bluetooth.pbap.accessdisallowed";
 
     /**
      * Intent indicating incoming obex authentication request which is from
@@ -120,12 +106,6 @@ public class BluetoothPbapService extends Service {
             "com.android.bluetooth.pbap.userconfirmtimeout";
 
     /**
-     * Intent Extra name indicating always allowed which is sent from
-     * BluetoothPbapActivity
-     */
-    public static final String EXTRA_ALWAYS_ALLOWED = "com.android.bluetooth.pbap.alwaysallowed";
-
-    /**
      * Intent Extra name indicating session key which is sent from
      * BluetoothPbapActivity
      */
@@ -151,11 +131,9 @@ public class BluetoothPbapService extends Service {
 
     private static final int AUTH_TIMEOUT = 3;
 
-    private static final int PORT_NUM = 19;
 
     private static final int USER_CONFIRM_TIMEOUT_VALUE = 30000;
 
-    private static final int TIME_TO_WAIT_VALUE = 6000;
 
     // Ensure not conflict with Opp notification ID
     private static final int NOTIFICATION_ID_ACCESS = -1000001;
@@ -194,6 +172,15 @@ public class BluetoothPbapService extends Service {
 
     private int mStartId = -1;
 
+    //private IBluetooth mBluetoothService;
+
+    private boolean isWaitingAuthorization = false;
+
+    // package and class name to which we send intent to check phone book access permission
+    private static final String ACCESS_AUTHORITY_PACKAGE = "com.android.settings";
+    private static final String ACCESS_AUTHORITY_CLASS =
+        "com.android.settings.bluetooth.BluetoothPermissionRequest";
+
     public BluetoothPbapService() {
         mState = BluetoothPbap.STATE_DISCONNECTED;
     }
@@ -209,20 +196,19 @@ public class BluetoothPbapService extends Service {
         if (!mHasStarted) {
             mHasStarted = true;
             if (VERBOSE) Log.v(TAG, "Starting PBAP service");
-
+            BluetoothPbapConfig.init(this);
             int state = mAdapter.getState();
             if (state == BluetoothAdapter.STATE_ON) {
-                mSessionStatusHandler.sendMessageDelayed(mSessionStatusHandler
-                        .obtainMessage(START_LISTENER), TIME_TO_WAIT_VALUE);
+                mSessionStatusHandler.sendMessage(mSessionStatusHandler
+                        .obtainMessage(START_LISTENER));
             }
         }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (VERBOSE) Log.v(TAG, "Pbap Service onStartCommand");
-        int retCode = super.onStartCommand(intent, flags, startId);
-        if (retCode == START_STICKY) {
+        //int retCode = super.onStartCommand(intent, flags, startId);
+        //if (retCode == START_STICKY) {
             mStartId = startId;
             if (mAdapter == null) {
                 Log.w(TAG, "Stopping BluetoothPbapService: "
@@ -236,8 +222,8 @@ public class BluetoothPbapService extends Service {
                     parseIntent(intent);
                 }
             }
-        }
-        return retCode;
+        //}
+        return START_NOT_STICKY;
     }
 
     // process the intent from receiver
@@ -246,29 +232,51 @@ public class BluetoothPbapService extends Service {
         if (VERBOSE) Log.v(TAG, "action: " + action);
 
         int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+        if (VERBOSE) Log.v(TAG, "state: " + state);
+
         boolean removeTimeoutMsg = true;
         if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
-            removeTimeoutMsg = false;
-            if (state == BluetoothAdapter.STATE_OFF) {
+            if (state == BluetoothAdapter.STATE_TURNING_OFF) {
+                // Send any pending timeout now, as this service will be destroyed.
+                if (mSessionStatusHandler.hasMessages(USER_TIMEOUT)) {
+                    Intent timeoutIntent =
+                        new Intent(BluetoothDevice.ACTION_CONNECTION_ACCESS_CANCEL);
+                    timeoutIntent.setClassName(ACCESS_AUTHORITY_PACKAGE, ACCESS_AUTHORITY_CLASS);
+                    sendBroadcast(timeoutIntent, BLUETOOTH_ADMIN_PERM);
+                }
                 // Release all resources
                 closeService();
+            } else {
+                removeTimeoutMsg = false;
             }
-        } else if (action.equals(ACCESS_ALLOWED_ACTION)) {
-            if (intent.getBooleanExtra(EXTRA_ALWAYS_ALLOWED, false)) {
-                boolean result = mRemoteDevice.setTrust(true);
-                if (VERBOSE) Log.v(TAG, "setTrust() result=" + result);
+        } else if (action.equals(BluetoothDevice.ACTION_CONNECTION_ACCESS_REPLY)) {
+            if (!isWaitingAuthorization) {
+                // this reply is not for us
+                return;
             }
-            try {
-                if (mConnSocket != null) {
-                    startObexServerSession();
-                } else {
-                    stopObexServerSession();
+
+            isWaitingAuthorization = false;
+
+            if (intent.getIntExtra(BluetoothDevice.EXTRA_CONNECTION_ACCESS_RESULT,
+                                   BluetoothDevice.CONNECTION_ACCESS_NO) ==
+                BluetoothDevice.CONNECTION_ACCESS_YES) {
+
+                if (intent.getBooleanExtra(BluetoothDevice.EXTRA_ALWAYS_ALLOWED, false)) {
+                    boolean result = mRemoteDevice.setTrust(true);
+                    if (VERBOSE) Log.v(TAG, "setTrust() result=" + result);
                 }
-            } catch (IOException ex) {
-                Log.e(TAG, "Caught the error: " + ex.toString());
+                try {
+                    if (mConnSocket != null) {
+                        startObexServerSession();
+                    } else {
+                        stopObexServerSession();
+                    }
+                } catch (IOException ex) {
+                    Log.e(TAG, "Caught the error: " + ex.toString());
+                }
+            } else {
+                stopObexServerSession();
             }
-        } else if (action.equals(ACCESS_DISALLOWED_ACTION)) {
-            stopObexServerSession();
         } else if (action.equals(AUTH_RESPONSE_ACTION)) {
             String sessionkey = intent.getStringExtra(EXTRA_SESSION_KEY);
             notifyAuthKeyInput(sessionkey);
@@ -294,6 +302,9 @@ public class BluetoothPbapService extends Service {
             mWakeLock = null;
         }
         closeService();
+        if(mSessionStatusHandler != null) {
+            mSessionStatusHandler.removeCallbacksAndMessages(null);
+        }
     }
 
     @Override
@@ -305,12 +316,6 @@ public class BluetoothPbapService extends Service {
     private void startRfcommSocketListener() {
         if (VERBOSE) Log.v(TAG, "Pbap Service startRfcommSocketListener");
 
-        if (mServerSocket == null) {
-            if (!initSocket()) {
-                closeService();
-                return;
-            }
-        }
         if (mAcceptThread == null) {
             mAcceptThread = new SocketAcceptThread();
             mAcceptThread.setName("BluetoothPbapAcceptThread");
@@ -329,22 +334,26 @@ public class BluetoothPbapService extends Service {
             try {
                 // It is mandatory for PSE to support initiation of bonding and
                 // encryption.
-                // InsecureRfcomm => encryption is on, authentication of link
-                // key is off. For legacy pairing it doesn't matter, for 2.1
-                // pairing - if we have already done MITM protection, then
-                // the same linkeys will be used. If not, then all core profiles
-                // will have the same level of protection. This API has to be
-                // renamed - its no as insecure as the name suggests.
-                mServerSocket = mAdapter.listenUsingInsecureRfcommOn(PORT_NUM);
+                mServerSocket = mAdapter.listenUsingEncryptedRfcommWithServiceRecord
+                    ("OBEX Phonebook Access Server", BluetoothUuid.PBAP_PSE.getUuid());
+
             } catch (IOException e) {
                 Log.e(TAG, "Error create RfcommServerSocket " + e.toString());
                 initSocketOK = false;
             }
             if (!initSocketOK) {
+                // Need to break out of this loop if BT is being turned off.
+                if (mAdapter == null) break;
+                int state = mAdapter.getState();
+                if ((state != BluetoothAdapter.STATE_TURNING_ON) &&
+                    (state != BluetoothAdapter.STATE_ON)) {
+                    Log.w(TAG, "initServerSocket failed as BT is (being) turned off");
+                    break;
+                }
                 synchronized (this) {
                     try {
-                        if (VERBOSE) Log.v(TAG, "wait 3 seconds");
-                        Thread.sleep(3000);
+                        if (VERBOSE) Log.v(TAG, "wait 300 ms");
+                        Thread.sleep(300);
                     } catch (InterruptedException e) {
                         Log.e(TAG, "socketAcceptThread thread was interrupted (3)");
                         mInterrupted = true;
@@ -356,7 +365,7 @@ public class BluetoothPbapService extends Service {
         }
 
         if (initSocketOK) {
-            if (VERBOSE) Log.v(TAG, "Succeed to create listening socket on channel " + PORT_NUM);
+            if (VERBOSE) Log.v(TAG, "Succeed to create listening socket ");
 
         } else {
             Log.e(TAG, "Error to create listening socket after " + CREATE_RETRY_TIME + " try");
@@ -371,18 +380,20 @@ public class BluetoothPbapService extends Service {
 
             if (mServerSocket != null) {
                 mServerSocket.close();
+                mServerSocket = null;
             }
         }
 
         if (accept == true) {
             if (mConnSocket != null) {
                 mConnSocket.close();
+                mConnSocket = null;
             }
         }
     }
 
     private final void closeService() {
-        if (VERBOSE) Log.v(TAG, "Pbap Service closeService");
+        if (VERBOSE) Log.v(TAG, "Pbap Service closeService in");
 
         try {
             closeSocket(true, true);
@@ -399,18 +410,17 @@ public class BluetoothPbapService extends Service {
                 Log.w(TAG, "mAcceptThread close error" + ex);
             }
         }
-        mServerSocket = null;
-        mConnSocket = null;
-
         if (mServerSession != null) {
             mServerSession.close();
             mServerSession = null;
         }
 
         mHasStarted = false;
-        if (stopSelfResult(mStartId)) {
+        if (mStartId != -1 && stopSelfResult(mStartId)) {
             if (VERBOSE) Log.v(TAG, "successfully stopped pbap service");
+            mStartId = -1;
         }
+        if (VERBOSE) Log.v(TAG, "Pbap Service closeService out");
     }
 
     private final void startObexServerSession() throws IOException {
@@ -465,7 +475,7 @@ public class BluetoothPbapService extends Service {
 
         try {
             closeSocket(false, true);
-            mConnSocket = null;
+	    mConnSocket = null;
         } catch (IOException e) {
             Log.e(TAG, "closeSocket error: " + e.toString());
         }
@@ -506,9 +516,18 @@ public class BluetoothPbapService extends Service {
 
         @Override
         public void run() {
+            if (mServerSocket == null) {
+                if (!initSocket()) {
+                    closeService();
+                    return;
+                }
+            }
+
             while (!stopped) {
                 try {
+                    if (VERBOSE) Log.v(TAG, "Accepting socket connection...");
                     mConnSocket = mServerSocket.accept();
+                    if (VERBOSE) Log.v(TAG, "Accepted socket connection...");
 
                     mRemoteDevice = mConnSocket.getRemoteDevice();
                     if (mRemoteDevice == null) {
@@ -525,7 +544,7 @@ public class BluetoothPbapService extends Service {
 
                     if (trust) {
                         try {
-                            if (VERBOSE) Log.v(TAG, "incomming connection accepted from: "
+                            if (VERBOSE) Log.v(TAG, "incoming connection accepted from: "
                                 + sRemoteDeviceName + " automatically as trusted device");
                             startObexServerSession();
                         } catch (IOException ex) {
@@ -533,8 +552,19 @@ public class BluetoothPbapService extends Service {
                                     + ex.toString());
                         }
                     } else {
-                        createPbapNotification(ACCESS_REQUEST_ACTION);
-                        if (VERBOSE) Log.v(TAG, "incomming connection accepted from: "
+                        Intent intent = new
+                            Intent(BluetoothDevice.ACTION_CONNECTION_ACCESS_REQUEST);
+                        intent.setClassName(ACCESS_AUTHORITY_PACKAGE, ACCESS_AUTHORITY_CLASS);
+                        intent.putExtra(BluetoothDevice.EXTRA_ACCESS_REQUEST_TYPE,
+                                        BluetoothDevice.REQUEST_TYPE_PHONEBOOK_ACCESS);
+                        intent.putExtra(BluetoothDevice.EXTRA_DEVICE, mRemoteDevice);
+                        intent.putExtra(BluetoothDevice.EXTRA_PACKAGE_NAME, getPackageName());
+                        intent.putExtra(BluetoothDevice.EXTRA_CLASS_NAME,
+                                        BluetoothPbapReceiver.class.getName());
+                        sendBroadcast(intent, BLUETOOTH_ADMIN_PERM);
+                        isWaitingAuthorization = true;
+
+                        if (VERBOSE) Log.v(TAG, "waiting for authorization for connection from: "
                                 + sRemoteDeviceName);
 
                         // In case car kit time out and try to use HFP for
@@ -546,9 +576,12 @@ public class BluetoothPbapService extends Service {
                     }
                     stopped = true; // job done ,close this thread;
                 } catch (IOException ex) {
+                    stopped=true;
+                    /*
                     if (stopped) {
                         break;
                     }
+                    */
                     if (VERBOSE) Log.v(TAG, "Accept exception: " + ex.toString());
                 }
             }
@@ -565,7 +598,6 @@ public class BluetoothPbapService extends Service {
         public void handleMessage(Message msg) {
             if (VERBOSE) Log.v(TAG, "Handler(): got msg=" + msg.what);
 
-            CharSequence tmpTxt;
             switch (msg.what) {
                 case START_LISTENER:
                     if (mAdapter.isEnabled()) {
@@ -575,9 +607,10 @@ public class BluetoothPbapService extends Service {
                     }
                     break;
                 case USER_TIMEOUT:
-                    Intent intent = new Intent(USER_CONFIRM_TIMEOUT_ACTION);
+                    Intent intent = new Intent(BluetoothDevice.ACTION_CONNECTION_ACCESS_CANCEL);
+                    intent.setClassName(ACCESS_AUTHORITY_PACKAGE, ACCESS_AUTHORITY_CLASS);
                     sendBroadcast(intent);
-                    removePbapNotification(NOTIFICATION_ID_ACCESS);
+                    isWaitingAuthorization = false;
                     stopObexServerSession();
                     break;
                 case AUTH_TIMEOUT:
@@ -613,12 +646,18 @@ public class BluetoothPbapService extends Service {
         if (state != mState) {
             if (DEBUG) Log.d(TAG, "Pbap state " + mState + " -> " + state + ", result = "
                     + result);
-            Intent intent = new Intent(BluetoothPbap.PBAP_STATE_CHANGED_ACTION);
-            intent.putExtra(BluetoothPbap.PBAP_PREVIOUS_STATE, mState);
+            int prevState = mState;
             mState = state;
+            Intent intent = new Intent(BluetoothPbap.PBAP_STATE_CHANGED_ACTION);
+            intent.putExtra(BluetoothPbap.PBAP_PREVIOUS_STATE, prevState);
             intent.putExtra(BluetoothPbap.PBAP_STATE, mState);
             intent.putExtra(BluetoothDevice.EXTRA_DEVICE, mRemoteDevice);
             sendBroadcast(intent, BLUETOOTH_PERM);
+            AdapterService s = AdapterService.getAdapterService();
+            if (s != null) {
+                s.onProfileConnectionStateChanged(mRemoteDevice, BluetoothProfile.PBAP,
+                        mState, prevState);
+            }
         }
     }
 
@@ -641,20 +680,7 @@ public class BluetoothPbapService extends Service {
         Notification notification = null;
         String name = getRemoteDeviceName();
 
-        if (action.equals(ACCESS_REQUEST_ACTION)) {
-            deleteIntent.setAction(ACCESS_DISALLOWED_ACTION);
-            notification = new Notification(android.R.drawable.stat_sys_data_bluetooth,
-                getString(R.string.pbap_notif_ticker), System.currentTimeMillis());
-            notification.setLatestEventInfo(this, getString(R.string.pbap_notif_title),
-                    getString(R.string.pbap_notif_message, name), PendingIntent
-                            .getActivity(this, 0, clickIntent, 0));
-
-            notification.flags |= Notification.FLAG_AUTO_CANCEL;
-            notification.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
-            notification.defaults = Notification.DEFAULT_SOUND;
-            notification.deleteIntent = PendingIntent.getBroadcast(this, 0, deleteIntent, 0);
-            nm.notify(NOTIFICATION_ID_ACCESS, notification);
-        } else if (action.equals(AUTH_CHALL_ACTION)) {
+        if (action.equals(AUTH_CHALL_ACTION)) {
             deleteIntent.setAction(AUTH_CANCELLED_ACTION);
             notification = new Notification(android.R.drawable.stat_sys_data_bluetooth,
                 getString(R.string.auth_notif_ticker), System.currentTimeMillis());
@@ -695,12 +721,22 @@ public class BluetoothPbapService extends Service {
         public int getState() {
             if (DEBUG) Log.d(TAG, "getState " + mState);
 
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"getState(): not allowed for non-active user");
+                return BluetoothPbap.STATE_DISCONNECTED;
+            }
+
             enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
             return mState;
         }
 
         public BluetoothDevice getClient() {
             if (DEBUG) Log.d(TAG, "getClient" + mRemoteDevice);
+
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"getClient(): not allowed for non-active user");
+                return null;
+            }
 
             enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
             if (mState == BluetoothPbap.STATE_DISCONNECTED) {
@@ -710,11 +746,21 @@ public class BluetoothPbapService extends Service {
         }
 
         public boolean isConnected(BluetoothDevice device) {
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"isConnected(): not allowed for non-active user");
+                return false;
+            }
+
             enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
             return mState == BluetoothPbap.STATE_CONNECTED && mRemoteDevice.equals(device);
         }
 
         public boolean connect(BluetoothDevice device) {
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"connect(): not allowed for non-active user");
+                return false;
+            }
+
             enforceCallingOrSelfPermission(BLUETOOTH_ADMIN_PERM,
                     "Need BLUETOOTH_ADMIN permission");
             return false;
@@ -722,6 +768,11 @@ public class BluetoothPbapService extends Service {
 
         public void disconnect() {
             if (DEBUG) Log.d(TAG, "disconnect");
+
+            if (!Utils.checkCaller()) {
+                Log.w(TAG,"disconnect(): not allowed for non-active user");
+                return;
+            }
 
             enforceCallingOrSelfPermission(BLUETOOTH_ADMIN_PERM,
                     "Need BLUETOOTH_ADMIN permission");

@@ -61,10 +61,8 @@ public class BluetoothOppReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
 
-        if (action.equals(Intent.ACTION_BOOT_COMPLETED)) {
 
-            context.startService(new Intent(context, BluetoothOppService.class));
-        } else if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
+        if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
             if (BluetoothAdapter.STATE_ON == intent.getIntExtra(
                     BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
                 if (V) Log.v(TAG, "Received BLUETOOTH_STATE_CHANGED_ACTION, BLUETOOTH_STATE_ON");
@@ -183,6 +181,14 @@ public class BluetoothOppReceiver extends BroadcastReceiver {
             in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             in.putExtra("direction", BluetoothShare.DIRECTION_INBOUND);
             context.startActivity(in);
+        } else if (action.equals(Constants.ACTION_OPEN_RECEIVED_FILES)) {
+            if (V) Log.v(TAG, "Received ACTION_OPEN_RECEIVED_FILES.");
+
+            Intent in = new Intent(context, BluetoothOppTransferHistory.class);
+            in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            in.putExtra("direction", BluetoothShare.DIRECTION_INBOUND);
+            in.putExtra(Constants.EXTRA_SHOW_ALL_FILES, true);
+            context.startActivity(in);
         } else if (action.equals(Constants.ACTION_HIDE)) {
             if (V) Log.v(TAG, "Receiver hide for " + intent.getData());
             Cursor cursor = context.getContentResolver().query(intent.getData(), null, null, null,
@@ -220,6 +226,34 @@ public class BluetoothOppReceiver extends BroadcastReceiver {
             transInfo = BluetoothOppUtility.queryRecord(context, intent.getData());
             if (transInfo == null) {
                 Log.e(TAG, "Error: Can not get data from db");
+                return;
+            }
+
+            if (transInfo.mHandoverInitiated) {
+                // Deal with handover-initiated transfers separately
+                Intent handoverIntent = new Intent(Constants.ACTION_BT_OPP_TRANSFER_DONE);
+                if (transInfo.mDirection == BluetoothShare.DIRECTION_INBOUND) {
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_DIRECTION,
+                            Constants.DIRECTION_BLUETOOTH_INCOMING);
+                } else {
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_DIRECTION,
+                            Constants.DIRECTION_BLUETOOTH_OUTGOING);
+                }
+                handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_ID, transInfo.mID);
+                handoverIntent.putExtra(Constants.EXTRA_BT_OPP_ADDRESS, transInfo.mDestAddr);
+
+                if (BluetoothShare.isStatusSuccess(transInfo.mStatus)) {
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_STATUS,
+                            Constants.HANDOVER_TRANSFER_STATUS_SUCCESS);
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_URI,
+                            transInfo.mFileName);
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_MIMETYPE,
+                            transInfo.mFileType);
+                } else {
+                    handoverIntent.putExtra(Constants.EXTRA_BT_OPP_TRANSFER_STATUS,
+                            Constants.HANDOVER_TRANSFER_STATUS_FAILURE);
+                }
+                context.sendBroadcast(handoverIntent, Constants.HANDOVER_STATUS_PERMISSION);
                 return;
             }
 

@@ -180,8 +180,18 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
             return ResponseCodes.OBEX_HTTP_FORBIDDEN;
         }
 
+        String destination;
+        if (mTransport instanceof BluetoothOppRfcommTransport) {
+            destination = ((BluetoothOppRfcommTransport)mTransport).getRemoteAddress();
+        } else {
+            destination = "FF:FF:FF:00:00:00";
+        }
+        boolean isWhitelisted = BluetoothOppManager.getInstance(mContext).
+                isWhitelisted(destination);
+
         try {
             boolean pre_reject = false;
+
             request = op.getReceivedHeader();
             if (V) Constants.logHeader(request);
             name = (String)request.getHeader(HeaderSet.NAME);
@@ -204,8 +214,9 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
                 /* first we look for Mimetype in Android map */
                 String extension, type;
                 int dotIndex = name.lastIndexOf(".");
-                if (dotIndex < 0) {
-                    if (D) Log.w(TAG, "There is no file extension, reject the transfer");
+                if (dotIndex < 0 && mimeType == null) {
+                    if (D) Log.w(TAG, "There is no file extension or mime type," +
+                            "reject the transfer");
                     pre_reject = true;
                     obexResponse = ResponseCodes.OBEX_HTTP_BAD_REQUEST;
                 } else {
@@ -230,10 +241,13 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
             }
 
             // Reject policy: anything outside the "white list" plus unspecified
-            // MIME Types.
+            // MIME Types. Also reject everything in the "black list".
             if (!pre_reject
-                    && (mimeType == null || (!Constants.mimeTypeMatches(mimeType,
-                            Constants.ACCEPTABLE_SHARE_INBOUND_TYPES)))) {
+                    && (mimeType == null
+                            || (!isWhitelisted && !Constants.mimeTypeMatches(mimeType,
+                                    Constants.ACCEPTABLE_SHARE_INBOUND_TYPES))
+                            || Constants.mimeTypeMatches(mimeType,
+                                    Constants.UNACCEPTABLE_SHARE_INBOUND_TYPES))) {
                 if (D) Log.w(TAG, "mimeType is null or in unacceptable list, reject the transfer");
                 pre_reject = true;
                 obexResponse = ResponseCodes.OBEX_HTTP_UNSUPPORTED_TYPE;
@@ -255,12 +269,7 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
         values.put(BluetoothShare.TOTAL_BYTES, length.intValue());
         values.put(BluetoothShare.MIMETYPE, mimeType);
 
-        if (mTransport instanceof BluetoothOppRfcommTransport) {
-            String a = ((BluetoothOppRfcommTransport)mTransport).getRemoteAddress();
-            values.put(BluetoothShare.DESTINATION, a);
-        } else {
-            values.put(BluetoothShare.DESTINATION, "FF:FF:FF:00:00:00");
-        }
+        values.put(BluetoothShare.DESTINATION, destination);
 
         values.put(BluetoothShare.DIRECTION, BluetoothShare.DIRECTION_INBOUND);
         values.put(BluetoothShare.TIMESTAMP, mTimestamp);
@@ -270,6 +279,12 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
         if (!mServerBlocking) {
             values.put(BluetoothShare.USER_CONFIRMATION,
                     BluetoothShare.USER_CONFIRMATION_AUTO_CONFIRMED);
+            needConfirm = false;
+        }
+
+        if (isWhitelisted) {
+            values.put(BluetoothShare.USER_CONFIRMATION,
+                    BluetoothShare.USER_CONFIRMATION_HANDOVER_CONFIRMED);
             needConfirm = false;
         }
 
@@ -332,7 +347,8 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
         int status = BluetoothShare.STATUS_SUCCESS;
 
         if (mAccepted == BluetoothShare.USER_CONFIRMATION_CONFIRMED
-                || mAccepted == BluetoothShare.USER_CONFIRMATION_AUTO_CONFIRMED) {
+                || mAccepted == BluetoothShare.USER_CONFIRMATION_AUTO_CONFIRMED
+                || mAccepted == BluetoothShare.USER_CONFIRMATION_HANDOVER_CONFIRMED) {
             /* Confirm or auto-confirm */
 
             if (mFileInfo.mFileName == null) {
@@ -470,7 +486,12 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
                 }
             } catch (IOException e1) {
                 Log.e(TAG, "Error when receiving file");
-                status = BluetoothShare.STATUS_OBEX_DATA_ERROR;
+                /* OBEX Abort packet received from remote device */
+                if ("Abort Received".equals(e1.getMessage())) {
+                    status = BluetoothShare.STATUS_CANCELED;
+                } else {
+                    status = BluetoothShare.STATUS_OBEX_DATA_ERROR;
+                }
                 error = true;
             }
         }
@@ -522,7 +543,7 @@ public class BluetoothOppObexServerSession extends ServerRequestHandler implemen
             byte[] uuid = (byte[])request.getHeader(HeaderSet.TARGET);
             if (V) Log.v(TAG, "onConnect(): uuid =" + Arrays.toString(uuid));
             if(uuid != null) {
-                reply.setHeader(HeaderSet.WHO, uuid);
+                 return ResponseCodes.OBEX_HTTP_NOT_ACCEPTABLE;
             }
         } catch (IOException e) {
             Log.e(TAG, e.toString());

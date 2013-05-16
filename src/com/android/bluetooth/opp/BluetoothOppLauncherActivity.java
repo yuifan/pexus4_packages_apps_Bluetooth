@@ -41,8 +41,10 @@ import java.io.IOException;
 import java.util.ArrayList;
 
 import android.app.Activity;
+import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothDevicePicker;
 import android.content.Intent;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Bundle;
@@ -67,6 +69,17 @@ public class BluetoothOppLauncherActivity extends Activity {
         String action = intent.getAction();
 
         if (action.equals(Intent.ACTION_SEND) || action.equals(Intent.ACTION_SEND_MULTIPLE)) {
+            //Check if Bluetooth is available in the beginning instead of at the end
+            if (!isBluetoothAllowed()) {
+                Intent in = new Intent(this, BluetoothOppBtErrorActivity.class);
+                in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                in.putExtra("title", this.getString(R.string.airplane_error_title));
+                in.putExtra("content", this.getString(R.string.airplane_error_msg));
+                startActivity(in);
+                finish();
+                return;
+            }
+
             /*
              * Other application is trying to share a file via Bluetooth,
              * probably Pictures, videos, or vCards. The Intent should contain
@@ -74,8 +87,8 @@ public class BluetoothOppLauncherActivity extends Activity {
              */
             if (action.equals(Intent.ACTION_SEND)) {
                 // TODO: handle type == null case
-                String type = intent.getType();
-                Uri stream = (Uri)intent.getParcelableExtra(Intent.EXTRA_STREAM);
+                final String type = intent.getType();
+                final Uri stream = (Uri)intent.getParcelableExtra(Intent.EXTRA_STREAM);
                 CharSequence extra_text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
                 // If we get ACTION_SEND intent with EXTRA_STREAM, we'll use the
                 // uri data;
@@ -87,16 +100,38 @@ public class BluetoothOppLauncherActivity extends Activity {
                                 + type);
                     // Save type/stream, will be used when adding transfer
                     // session to DB.
-                    BluetoothOppManager.getInstance(this).saveSendingFileInfo(type,
-                            stream.toString());
+                    Thread t = new Thread(new Runnable() {
+                        public void run() {
+                            BluetoothOppManager.getInstance(BluetoothOppLauncherActivity.this)
+                                .saveSendingFileInfo(type,stream.toString(), false);
+                            //Done getting file info..Launch device picker and finish this activity
+                            launchDevicePicker();
+                            finish();
+                        }
+                    });
+                    t.start();
+                    return;
                 } else if (extra_text != null && type != null) {
                     if (V) Log.v(TAG, "Get ACTION_SEND intent with Extra_text = "
                                 + extra_text.toString() + "; mimetype = " + type);
-                    Uri fileUri = creatFileForSharedContent(this, extra_text);
-
+                    final Uri fileUri = creatFileForSharedContent(this, extra_text);
                     if (fileUri != null) {
-                        BluetoothOppManager.getInstance(this).saveSendingFileInfo(type,
-                                fileUri.toString());
+                        Thread t = new Thread(new Runnable() {
+                            public void run() {
+                                BluetoothOppManager.getInstance(BluetoothOppLauncherActivity.this)
+                                    .saveSendingFileInfo(type,fileUri.toString(), false);
+                                //Done getting file info..Launch device picker
+                                //and finish this activity
+                                launchDevicePicker();
+                                finish();
+                            }
+                        });
+                        t.start();
+                        return;
+                    } else {
+                        Log.w(TAG,"Error trying to do set text...File not created!");
+                        finish();
+                        return;
                     }
                 } else {
                     Log.e(TAG, "type is null; or sending file URI is null");
@@ -104,52 +139,28 @@ public class BluetoothOppLauncherActivity extends Activity {
                     return;
                 }
             } else if (action.equals(Intent.ACTION_SEND_MULTIPLE)) {
-                ArrayList<Uri> uris = new ArrayList<Uri>();
-                String mimeType = intent.getType();
-                uris = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+                final String mimeType = intent.getType();
+                final ArrayList<Uri> uris = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
                 if (mimeType != null && uris != null) {
                     if (V) Log.v(TAG, "Get ACTION_SHARE_MULTIPLE intent: uris " + uris + "\n Type= "
                                 + mimeType);
-                    BluetoothOppManager.getInstance(this).saveSendingFileInfo(mimeType, uris);
+                    Thread t = new Thread(new Runnable() {
+                        public void run() {
+                            BluetoothOppManager.getInstance(BluetoothOppLauncherActivity.this)
+                                .saveSendingFileInfo(mimeType,uris, false);
+                            //Done getting file info..Launch device picker
+                            //and finish this activity
+                            launchDevicePicker();
+                            finish();
+                        }
+                    });
+                    t.start();
+                    return;
                 } else {
                     Log.e(TAG, "type is null; or sending files URIs are null");
                     finish();
                     return;
                 }
-            }
-
-            if (isAirplaneModeOn()) {
-                Intent in = new Intent(this, BluetoothOppBtErrorActivity.class);
-                in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                in.putExtra("title", this.getString(R.string.airplane_error_title));
-                in.putExtra("content", this.getString(R.string.airplane_error_msg));
-                this.startActivity(in);
-
-                finish();
-                return;
-            }
-
-            // TODO: In the future, we may send intent to DevicePickerActivity
-            // directly,
-            // and let DevicePickerActivity to handle Bluetooth Enable.
-            if (!BluetoothOppManager.getInstance(this).isEnabled()) {
-                if (V) Log.v(TAG, "Prepare Enable BT!! ");
-                Intent in = new Intent(this, BluetoothOppBtEnableActivity.class);
-                in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                this.startActivity(in);
-            } else {
-                if (V) Log.v(TAG, "BT already enabled!! ");
-                Intent in1 = new Intent(BluetoothDevicePicker.ACTION_LAUNCH);
-                in1.setFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
-                in1.putExtra(BluetoothDevicePicker.EXTRA_NEED_AUTH, false);
-                in1.putExtra(BluetoothDevicePicker.EXTRA_FILTER_TYPE,
-                        BluetoothDevicePicker.FILTER_TYPE_TRANSFER);
-                in1.putExtra(BluetoothDevicePicker.EXTRA_LAUNCH_PACKAGE,
-                        Constants.THIS_PACKAGE_NAME);
-                in1.putExtra(BluetoothDevicePicker.EXTRA_LAUNCH_CLASS,
-                        BluetoothOppReceiver.class.getName());
-
-                this.startActivity(in1);
             }
         } else if (action.equals(Constants.ACTION_OPEN)) {
             Uri uri = getIntent().getData();
@@ -160,15 +171,74 @@ public class BluetoothOppLauncherActivity extends Activity {
             intent1.setClassName(Constants.THIS_PACKAGE_NAME, BluetoothOppReceiver.class.getName());
             intent1.setData(uri);
             this.sendBroadcast(intent1);
+            finish();
+        } else {
+            Log.w(TAG, "Unsupported action: " + action);
+            finish();
         }
-        finish();
     }
 
-    /* Returns true if airplane mode is currently on */
-    private final boolean isAirplaneModeOn() {
-        return Settings.System.getInt(this.getContentResolver(), Settings.System.AIRPLANE_MODE_ON,
-                0) == 1;
+    /**
+     * Turns on Bluetooth if not already on, or launches device picker if Bluetooth is on
+     * @return
+     */
+    private final void launchDevicePicker() {
+        // TODO: In the future, we may send intent to DevicePickerActivity
+        // directly,
+        // and let DevicePickerActivity to handle Bluetooth Enable.
+        if (!BluetoothOppManager.getInstance(this).isEnabled()) {
+            if (V) Log.v(TAG, "Prepare Enable BT!! ");
+            Intent in = new Intent(this, BluetoothOppBtEnableActivity.class);
+            in.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(in);
+        } else {
+            if (V) Log.v(TAG, "BT already enabled!! ");
+            Intent in1 = new Intent(BluetoothDevicePicker.ACTION_LAUNCH);
+            in1.setFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            in1.putExtra(BluetoothDevicePicker.EXTRA_NEED_AUTH, false);
+            in1.putExtra(BluetoothDevicePicker.EXTRA_FILTER_TYPE,
+                    BluetoothDevicePicker.FILTER_TYPE_TRANSFER);
+            in1.putExtra(BluetoothDevicePicker.EXTRA_LAUNCH_PACKAGE,
+                    Constants.THIS_PACKAGE_NAME);
+            in1.putExtra(BluetoothDevicePicker.EXTRA_LAUNCH_CLASS,
+                    BluetoothOppReceiver.class.getName());
+            if (V) {Log.d(TAG,"Launching " +BluetoothDevicePicker.ACTION_LAUNCH );}
+            startActivity(in1);
+        }
     }
+    /* Returns true if Bluetooth is allowed given current airplane mode settings. */
+    private final boolean isBluetoothAllowed() {
+        final ContentResolver resolver = this.getContentResolver();
+
+        // Check if airplane mode is on
+        final boolean isAirplaneModeOn = Settings.System.getInt(resolver,
+                Settings.System.AIRPLANE_MODE_ON, 0) == 1;
+        if (!isAirplaneModeOn) {
+            return true;
+        }
+
+        // Check if airplane mode matters
+        final String airplaneModeRadios = Settings.System.getString(resolver,
+                Settings.System.AIRPLANE_MODE_RADIOS);
+        final boolean isAirplaneSensitive = airplaneModeRadios == null ? true :
+                airplaneModeRadios.contains(Settings.System.RADIO_BLUETOOTH);
+        if (!isAirplaneSensitive) {
+            return true;
+        }
+
+        // Check if Bluetooth may be enabled in airplane mode
+        final String airplaneModeToggleableRadios = Settings.System.getString(resolver,
+                Settings.System.AIRPLANE_MODE_TOGGLEABLE_RADIOS);
+        final boolean isAirplaneToggleable = airplaneModeToggleableRadios == null ? false :
+                airplaneModeToggleableRadios.contains(Settings.System.RADIO_BLUETOOTH);
+        if (isAirplaneToggleable) {
+            return true;
+        }
+
+        // If we get here we're not allowed to use Bluetooth right now
+        return false;
+    }
+
     private Uri creatFileForSharedContent(Context context, CharSequence shareContent) {
         if (shareContent == null) {
             return null;

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2008-2009, Motorola, Inc.
+ * Copyright (C) 2009-2012, Broadcom Corporation
  *
  * All rights reserved.
  *
@@ -36,9 +37,6 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
-import android.pim.vcard.VCardComposer;
-import android.pim.vcard.VCardConfig;
-import android.pim.vcard.VCardComposer.OneEntryHandler;
 import android.provider.CallLog;
 import android.provider.CallLog.Calls;
 import android.provider.ContactsContract.CommonDataKinds;
@@ -46,10 +44,15 @@ import android.provider.ContactsContract.Contacts;
 import android.provider.ContactsContract.Data;
 import android.provider.ContactsContract.CommonDataKinds.Phone;
 import android.provider.ContactsContract.PhoneLookup;
+import android.telephony.PhoneNumberUtils;
 import android.text.TextUtils;
 import android.util.Log;
 
 import com.android.bluetooth.R;
+import com.android.vcard.VCardComposer;
+import com.android.vcard.VCardConfig;
+import com.android.internal.telephony.CallerInfo;
+import com.android.vcard.VCardPhoneNumberTranslationCallback;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -58,6 +61,8 @@ import java.util.ArrayList;
 import javax.obex.ServerOperation;
 import javax.obex.Operation;
 import javax.obex.ResponseCodes;
+
+import com.android.bluetooth.Utils;
 
 public class BluetoothPbapVcardManager {
     private static final String TAG = "BluetoothPbapVcardManager";
@@ -68,8 +73,6 @@ public class BluetoothPbapVcardManager {
 
     private Context mContext;
 
-    private StringBuilder mVcardResults = null;
-
     static final String[] PHONES_PROJECTION = new String[] {
             Data._ID, // 0
             CommonDataKinds.Phone.TYPE, // 1
@@ -78,15 +81,7 @@ public class BluetoothPbapVcardManager {
             Contacts.DISPLAY_NAME, // 4
     };
 
-    private static final int ID_COLUMN_INDEX = 0;
-
-    private static final int PHONE_TYPE_COLUMN_INDEX = 1;
-
-    private static final int PHONE_LABEL_COLUMN_INDEX = 2;
-
     private static final int PHONE_NUMBER_COLUMN_INDEX = 3;
-
-    private static final int CONTACTS_DISPLAY_NAME_COLUMN_INDEX = 4;
 
     static final String SORT_ORDER_PHONE_NUMBER = CommonDataKinds.Phone.NUMBER + " ASC";
 
@@ -112,8 +107,38 @@ public class BluetoothPbapVcardManager {
         mResolver = mContext.getContentResolver();
     }
 
-    public final String getOwnerPhoneNumberVcard(final boolean vcardType21) {
-        BluetoothPbapCallLogComposer composer = new BluetoothPbapCallLogComposer(mContext, false);
+    /**
+     * Create an owner vcard from the configured profile
+     * @param vcardType21
+     * @return
+     */
+    private final String getOwnerPhoneNumberVcardFromProfile(final boolean vcardType21, final byte[] filter) {
+        // Currently only support Generic Vcard 2.1 and 3.0
+        int vcardType;
+        if (vcardType21) {
+            vcardType = VCardConfig.VCARD_TYPE_V21_GENERIC;
+        } else {
+            vcardType = VCardConfig.VCARD_TYPE_V30_GENERIC;
+        }
+
+        if (!BluetoothPbapConfig.includePhotosInVcard()) {
+            vcardType |= VCardConfig.FLAG_REFRAIN_IMAGE_EXPORT;
+        }
+
+        return BluetoothPbapUtils.createProfileVCard(mContext, vcardType,filter);
+    }
+
+    public final String getOwnerPhoneNumberVcard(final boolean vcardType21, final byte[] filter) {
+        //Owner vCard enhancement: Use "ME" profile if configured
+        if (BluetoothPbapConfig.useProfileForOwnerVcard()) {
+            String vcard = getOwnerPhoneNumberVcardFromProfile(vcardType21, filter);
+            if (vcard != null && vcard.length() != 0) {
+                return vcard;
+            }
+        }
+        //End enhancement
+
+        BluetoothPbapCallLogComposer composer = new BluetoothPbapCallLogComposer(mContext);
         String name = BluetoothPbapService.getLocalPhoneName();
         String number = BluetoothPbapService.getLocalPhoneNum();
         String vcard = composer.composeVCardForPhoneOwnNumber(Phone.TYPE_MOBILE, name, number,
@@ -131,7 +156,7 @@ public class BluetoothPbapVcardManager {
                 size = getCallHistorySize(type);
                 break;
         }
-        if (V) Log.v(TAG, "getPhonebookSzie size = " + size + " type = " + type);
+        if (V) Log.v(TAG, "getPhonebookSize size = " + size + " type = " + type);
         return size;
     }
 
@@ -190,8 +215,13 @@ public class BluetoothPbapVcardManager {
                         callCursor.moveToNext()) {
                     String name = callCursor.getString(CALLS_NAME_COLUMN_INDEX);
                     if (TextUtils.isEmpty(name)) {
-                        // name not found,use number instead
+                        // name not found, use number instead
                         name = callCursor.getString(CALLS_NUMBER_COLUMN_INDEX);
+                        if (CallerInfo.UNKNOWN_NUMBER.equals(name) ||
+                                CallerInfo.PRIVATE_NUMBER.equals(name) ||
+                                CallerInfo.PAYPHONE_NUMBER.equals(name)) {
+                            name = mContext.getString(R.string.unknownNumber);
+                        }
                     }
                     list.add(name);
                 }
@@ -206,7 +236,16 @@ public class BluetoothPbapVcardManager {
 
     public final ArrayList<String> getPhonebookNameList(final int orderByWhat) {
         ArrayList<String> nameList = new ArrayList<String>();
-        nameList.add(BluetoothPbapService.getLocalPhoneName());
+        //Owner vCard enhancement. Use "ME" profile if configured
+        String ownerName = null;
+        if (BluetoothPbapConfig.useProfileForOwnerVcard()) {
+            ownerName = BluetoothPbapUtils.getProfileName(mContext);
+        }
+        if (ownerName == null || ownerName.length()==0) {
+            ownerName = BluetoothPbapService.getLocalPhoneName();
+        }
+        nameList.add(ownerName);
+        //End enhancement
 
         final Uri myUri = Contacts.CONTENT_URI;
         Cursor contactCursor = null;
@@ -242,8 +281,14 @@ public class BluetoothPbapVcardManager {
         ArrayList<String> nameList = new ArrayList<String>();
 
         Cursor contactCursor = null;
-        final Uri uri = Uri.withAppendedPath(PhoneLookup.CONTENT_FILTER_URI,
+        Uri uri = null;
+
+        if (phoneNumber != null && phoneNumber.length() == 0) {
+            uri = Contacts.CONTENT_URI;
+        } else {
+            uri = Uri.withAppendedPath(PhoneLookup.CONTENT_FILTER_URI,
                 Uri.encode(phoneNumber));
+        }
 
         try {
             contactCursor = mResolver.query(uri, CONTACTS_PROJECTION, CLAUSE_ONLY_VISIBLE,
@@ -431,6 +476,7 @@ public class BluetoothPbapVcardManager {
 
         if (isContacts) {
             VCardComposer composer = null;
+            HandlerForStringBuffer buffer = null;
             try {
                 // Currently only support Generic Vcard 2.1 and 3.0
                 int vcardType;
@@ -439,12 +485,33 @@ public class BluetoothPbapVcardManager {
                 } else {
                     vcardType = VCardConfig.VCARD_TYPE_V30_GENERIC;
                 }
-                vcardType |= VCardConfig.FLAG_REFRAIN_IMAGE_EXPORT;
-                vcardType |= VCardConfig.FLAG_REFRAIN_PHONE_NUMBER_FORMATTING;
 
-                composer = new VCardComposer(mContext, vcardType, true);
-                composer.addHandler(new HandlerForStringBuffer(op, ownerVCard));
-                if (!composer.init(Contacts.CONTENT_URI, selection, null, Contacts._ID)) {
+                if (!BluetoothPbapConfig.includePhotosInVcard()) {
+                    vcardType |= VCardConfig.FLAG_REFRAIN_IMAGE_EXPORT;
+                }
+
+                //Enhancement: customize Vcard based on preferences/settings and input from caller
+                composer = BluetoothPbapUtils.createFilteredVCardComposer(mContext, vcardType,null);
+                //End enhancement
+
+                // BT does want PAUSE/WAIT conversion while it doesn't want the other formatting
+                // done by vCard library by default.
+                composer.setPhoneNumberTranslationCallback(
+                        new VCardPhoneNumberTranslationCallback() {
+                            public String onValueReceived(
+                                    String rawValue, int type, String label, boolean isPrimary) {
+                                // 'p' and 'w' are the standard characters for pause and wait
+                                // (see RFC 3601)
+                                // so use those when exporting phone numbers via vCard.
+                                String numberWithControlSequence = rawValue
+                                        .replace(PhoneNumberUtils.PAUSE, 'p')
+                                        .replace(PhoneNumberUtils.WAIT, 'w');
+                                return numberWithControlSequence;
+                            }
+                        });
+                buffer = new HandlerForStringBuffer(op, ownerVCard);
+                if (!composer.init(Contacts.CONTENT_URI, selection, null, Contacts._ID) ||
+                        !buffer.onInit(mContext)) {
                     return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
                 }
 
@@ -454,24 +521,40 @@ public class BluetoothPbapVcardManager {
                         BluetoothPbapObexServer.sIsAborted = false;
                         break;
                     }
-                    if (!composer.createOneEntry()) {
+                    String vcard = composer.createOneEntry();
+                    if (vcard == null) {
                         Log.e(TAG, "Failed to read a contact. Error reason: "
                                 + composer.getErrorReason());
+                        return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
+                    }
+                    if (V) {
+                        Log.v(TAG, "Vcard Entry:");
+                        Log.v(TAG,vcard);
+                    }
+
+                    if (!buffer.onEntryCreated(vcard)) {
+                        // onEntryCreate() already emits error.
                         return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
                     }
                 }
             } finally {
                 if (composer != null) {
                     composer.terminate();
+                }
+                if (buffer != null) {
+                    buffer.onTerminate();
                 }
             }
         } else { // CallLog
             BluetoothPbapCallLogComposer composer = null;
+            HandlerForStringBuffer buffer = null;
             try {
-                composer = new BluetoothPbapCallLogComposer(mContext, true);
-                composer.addHandler(new HandlerForStringBuffer(op, ownerVCard));
+
+                composer = new BluetoothPbapCallLogComposer(mContext);
+                buffer = new HandlerForStringBuffer(op, ownerVCard);
                 if (!composer.init(CallLog.Calls.CONTENT_URI, selection, null,
-                                   CALLLOG_SORT_ORDER)) {
+                                   CALLLOG_SORT_ORDER) ||
+                                   !buffer.onInit(mContext)) {
                     return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
                 }
 
@@ -481,15 +564,25 @@ public class BluetoothPbapVcardManager {
                         BluetoothPbapObexServer.sIsAborted = false;
                         break;
                     }
-                    if (!composer.createOneEntry()) {
+                    String vcard = composer.createOneEntry(vcardType21);
+                    if (vcard == null) {
                         Log.e(TAG, "Failed to read a contact. Error reason: "
                                 + composer.getErrorReason());
                         return ResponseCodes.OBEX_HTTP_INTERNAL_ERROR;
                     }
+                    if (V) {
+                        Log.v(TAG, "Vcard Entry:");
+                        Log.v(TAG,vcard);
+                    }
+
+                    buffer.onEntryCreated(vcard);
                 }
             } finally {
                 if (composer != null) {
                     composer.terminate();
+                }
+                if (buffer != null) {
+                    buffer.onTerminate();
                 }
             }
         }
@@ -501,22 +594,17 @@ public class BluetoothPbapVcardManager {
     }
 
     /**
-     * Handler to emit VCard String to PCE once size grow to maxPacketSize.
+     * Handler to emit vCards to PCE.
      */
-    public class HandlerForStringBuffer implements OneEntryHandler {
-        @SuppressWarnings("hiding")
+    public class HandlerForStringBuffer {
         private Operation operation;
 
         private OutputStream outputStream;
-
-        private int maxPacketSize;
 
         private String phoneOwnVCard = null;
 
         public HandlerForStringBuffer(Operation op, String ownerVCard) {
             operation = op;
-            maxPacketSize = operation.getMaxPacketSize();
-            if (V) Log.v(TAG, "getMaxPacketSize() = " + maxPacketSize);
             if (ownerVCard != null) {
                 phoneOwnVCard = ownerVCard;
                 if (V) Log.v(TAG, "phone own number vcard:");
@@ -524,66 +612,36 @@ public class BluetoothPbapVcardManager {
             }
         }
 
-        public boolean onInit(Context context) {
+        private boolean write(String vCard) {
             try {
-                outputStream = operation.openOutputStream();
-                mVcardResults = new StringBuilder();
-                if (phoneOwnVCard != null) {
-                    mVcardResults.append(phoneOwnVCard);
+                if (vCard != null) {
+                    outputStream.write(vCard.getBytes());
+                    return true;
                 }
-            } catch (IOException e) {
-                Log.e(TAG, "open outputstrem failed" + e.toString());
-                return false;
-            }
-            if (V) Log.v(TAG, "openOutputStream() ok.");
-            return true;
-        }
-
-        public boolean onEntryCreated(String vcard) {
-            int vcardLen = vcard.length();
-            if (V) Log.v(TAG, "The length of this vcard is: " + vcardLen);
-
-            mVcardResults.append(vcard);
-            int vcardByteLen = mVcardResults.toString().getBytes().length;
-            if (V) Log.v(TAG, "The byte length of this vcardResults is: " + vcardByteLen);
-
-            if (vcardByteLen >= maxPacketSize) {
-                long timestamp = 0;
-                int position = 0;
-
-                // Need while loop to handle the big vcard case
-                while (!BluetoothPbapObexServer.sIsAborted
-                        && position < (vcardByteLen - maxPacketSize)) {
-                    if (V) timestamp = System.currentTimeMillis();
-
-                    String subStr = mVcardResults.toString().substring(position,
-                            position + maxPacketSize);
-                    try {
-                        outputStream.write(subStr.getBytes(), 0, maxPacketSize);
-                    } catch (IOException e) {
-                        Log.e(TAG, "write outputstrem failed" + e.toString());
-                        return false;
-                    }
-                    if (V) Log.v(TAG, "Sending vcard String " + maxPacketSize + " bytes took "
-                            + (System.currentTimeMillis() - timestamp) + " ms");
-
-                    position += maxPacketSize;
-                }
-                mVcardResults.delete(0, position);
-            }
-            return true;
-        }
-
-        public void onTerminate() {
-            // Send out last packet
-            byte[] lastBytes = mVcardResults.toString().getBytes();
-            try {
-                outputStream.write(lastBytes, 0, lastBytes.length);
             } catch (IOException e) {
                 Log.e(TAG, "write outputstrem failed" + e.toString());
             }
-            if (V) Log.v(TAG, "Last packet sent out, sending process complete!");
+            return false;
+        }
 
+        public boolean onInit(Context context) {
+            try {
+                outputStream = operation.openOutputStream();
+                if (phoneOwnVCard != null) {
+                    return write(phoneOwnVCard);
+                }
+                return true;
+            } catch (IOException e) {
+                Log.e(TAG, "open outputstrem failed" + e.toString());
+            }
+            return false;
+        }
+
+        public boolean onEntryCreated(String vcard) {
+            return write(vcard);
+        }
+
+        public void onTerminate() {
             if (!BluetoothPbapObexServer.closeStream(outputStream, operation)) {
                 if (V) Log.v(TAG, "CloseStream failed!");
             } else {

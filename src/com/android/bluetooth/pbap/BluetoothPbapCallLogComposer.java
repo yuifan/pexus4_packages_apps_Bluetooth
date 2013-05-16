@@ -16,26 +16,25 @@
 package com.android.bluetooth.pbap;
 
 import com.android.bluetooth.R;
+import com.android.internal.telephony.CallerInfo;
 
 import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteException;
 import android.net.Uri;
-import android.pim.vcard.VCardBuilder;
-import android.pim.vcard.VCardConfig;
-import android.pim.vcard.VCardConstants;
-import android.pim.vcard.VCardUtils;
-import android.pim.vcard.VCardComposer.OneEntryHandler;
 import android.provider.CallLog;
 import android.provider.CallLog.Calls;
 import android.text.TextUtils;
 import android.text.format.Time;
 import android.util.Log;
 
-import java.util.ArrayList;
+import com.android.vcard.VCardBuilder;
+import com.android.vcard.VCardConfig;
+import com.android.vcard.VCardConstants;
+import com.android.vcard.VCardUtils;
+
 import java.util.Arrays;
-import java.util.List;
 
 /**
  * VCard composer especially for Call Log used in Bluetooth.
@@ -76,23 +75,17 @@ public class BluetoothPbapCallLogComposer {
     private static final String VCARD_PROPERTY_CALLTYPE_OUTGOING = "DIALED";
     private static final String VCARD_PROPERTY_CALLTYPE_MISSED = "MISSED";
 
-    private static final String FLAG_TIMEZONE_UTC = "Z";
-
     private final Context mContext;
     private ContentResolver mContentResolver;
     private Cursor mCursor;
-    private final boolean mCareHandlerErrors;
 
     private boolean mTerminateIsCalled;
-    private final List<OneEntryHandler> mHandlerList;
 
     private String mErrorReason = NO_ERROR;
 
-    public BluetoothPbapCallLogComposer(final Context context, boolean careHandlerErrors) {
+    public BluetoothPbapCallLogComposer(final Context context) {
         mContext = context;
         mContentResolver = context.getContentResolver();
-        mCareHandlerErrors = careHandlerErrors;
-        mHandlerList = new ArrayList<OneEntryHandler>();
     }
 
     public boolean init(final Uri contentUri, final String selection,
@@ -113,24 +106,6 @@ public class BluetoothPbapCallLogComposer {
             return false;
         }
 
-        if (mCareHandlerErrors) {
-            List<OneEntryHandler> finishedList = new ArrayList<OneEntryHandler>(
-                    mHandlerList.size());
-            for (OneEntryHandler handler : mHandlerList) {
-                if (!handler.onInit(mContext)) {
-                    for (OneEntryHandler finished : finishedList) {
-                        finished.onTerminate();
-                    }
-                    return false;
-                }
-            }
-        } else {
-            // Just ignore the false returned from onInit().
-            for (OneEntryHandler handler : mHandlerList) {
-                handler.onInit(mContext);
-            }
-        }
-
         if (mCursor.getCount() == 0 || !mCursor.moveToFirst()) {
             try {
                 mCursor.close();
@@ -146,62 +121,40 @@ public class BluetoothPbapCallLogComposer {
         return true;
     }
 
-    public void addHandler(OneEntryHandler handler) {
-        if (handler != null) {
-            mHandlerList.add(handler);
-        }
-    }
-
-    public boolean createOneEntry() {
+    public String createOneEntry(boolean vcardVer21) {
         if (mCursor == null || mCursor.isAfterLast()) {
             mErrorReason = FAILURE_REASON_NOT_INITIALIZED;
-            return false;
+            return null;
         }
-
-        final String vcard;
         try {
-            vcard = createOneCallLogEntryInternal();
-        } catch (OutOfMemoryError error) {
-            Log.e(TAG, "OutOfMemoryError occured. Ignore the entry");
-            System.gc();
-            return true;
+            return createOneCallLogEntryInternal(vcardVer21);
         } finally {
             mCursor.moveToNext();
         }
-
-        if (mCareHandlerErrors) {
-            List<OneEntryHandler> finishedList = new ArrayList<OneEntryHandler>(
-                    mHandlerList.size());
-            for (OneEntryHandler handler : mHandlerList) {
-                if (!handler.onEntryCreated(vcard)) {
-                    return false;
-                }
-            }
-        } else {
-            for (OneEntryHandler handler : mHandlerList) {
-                handler.onEntryCreated(vcard);
-            }
-        }
-
-        return true;
     }
 
-    private String createOneCallLogEntryInternal() {
-        // We should not allow vCard composer to re-format phone numbers, since
-        // some characters are (inappropriately) removed and devices do not work fine.
-        final int vcardType = VCardConfig.VCARD_TYPE_V21_GENERIC |
+    private String createOneCallLogEntryInternal(boolean vcardVer21) {
+        final int vcardType = (vcardVer21 ? VCardConfig.VCARD_TYPE_V21_GENERIC :
+                VCardConfig.VCARD_TYPE_V30_GENERIC) |
                 VCardConfig.FLAG_REFRAIN_PHONE_NUMBER_FORMATTING;
         final VCardBuilder builder = new VCardBuilder(vcardType);
         String name = mCursor.getString(CALLER_NAME_COLUMN_INDEX);
         if (TextUtils.isEmpty(name)) {
-            name = mCursor.getString(NUMBER_COLUMN_INDEX);
+            name = "";
+        }
+        if (CallerInfo.UNKNOWN_NUMBER.equals(name) || CallerInfo.PRIVATE_NUMBER.equals(name) ||
+                CallerInfo.PAYPHONE_NUMBER.equals(name)) {
+            // setting name to "" as FN/N must be empty fields in this case.
+            name = "";
         }
         final boolean needCharset = !(VCardUtils.containsOnlyPrintableAscii(name));
         builder.appendLine(VCardConstants.PROPERTY_FN, name, needCharset, false);
         builder.appendLine(VCardConstants.PROPERTY_N, name, needCharset, false);
 
         String number = mCursor.getString(NUMBER_COLUMN_INDEX);
-        if (number.equals("-1")) {
+        if (CallerInfo.UNKNOWN_NUMBER.equals(number) ||
+                CallerInfo.PRIVATE_NUMBER.equals(number) ||
+                CallerInfo.PAYPHONE_NUMBER.equals(number)) {
             number = mContext.getString(R.string.unknownNumber);
         }
         final int type = mCursor.getInt(CALLER_NUMBERTYPE_COLUMN_INDEX);
@@ -242,13 +195,12 @@ public class BluetoothPbapCallLogComposer {
 
     /**
      * Format according to RFC 2445 DATETIME type.
-     * The format is: ("%Y%m%dT%H%M%SZ").
+     * The format is: ("%Y%m%dT%H%M%S").
      */
     private final String toRfc2455Format(final long millSecs) {
         Time startDate = new Time();
         startDate.set(millSecs);
-        String date = startDate.format2445();
-        return date + FLAG_TIMEZONE_UTC;
+        return startDate.format2445();
     }
 
     /**
@@ -263,7 +215,7 @@ public class BluetoothPbapCallLogComposer {
         // to the requesting device (For example, transferring phone book
         // when connected over bluetooth)
         //
-        // e.g. "X-IRMC-CALL-DATETIME;MISSED:20050320T100000Z"
+        // e.g. "X-IRMC-CALL-DATETIME;MISSED:20050320T100000"
         final int callLogType = mCursor.getInt(CALL_TYPE_COLUMN_INDEX);
         final String callLogTypeStr;
         switch (callLogType) {
@@ -291,10 +243,6 @@ public class BluetoothPbapCallLogComposer {
     }
 
     public void terminate() {
-        for (OneEntryHandler handler : mHandlerList) {
-            handler.onTerminate();
-        }
-
         if (mCursor != null) {
             try {
                 mCursor.close();

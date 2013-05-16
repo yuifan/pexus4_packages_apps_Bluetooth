@@ -62,8 +62,6 @@ public class BluetoothOppTransferHistory extends Activity implements
         View.OnCreateContextMenuListener, OnItemClickListener {
     private static final String TAG = "BluetoothOppTransferHistory";
 
-    private static final boolean D = Constants.DEBUG;
-
     private static final boolean V = Constants.VERBOSE;
 
     private ListView mListView;
@@ -76,6 +74,8 @@ public class BluetoothOppTransferHistory extends Activity implements
 
     private int mContextMenuPosition;
 
+    private boolean mShowAllIncoming;
+
     /** Class to handle Notification Manager updates */
     private BluetoothOppNotification mNotifier;
 
@@ -86,6 +86,9 @@ public class BluetoothOppTransferHistory extends Activity implements
         mListView = (ListView)findViewById(R.id.list);
         mListView.setEmptyView(findViewById(R.id.empty));
 
+        mShowAllIncoming = getIntent().getBooleanExtra(
+                Constants.EXTRA_SHOW_ALL_FILES, false);
+
         String direction;
         int dir = getIntent().getIntExtra("direction", 0);
         if (dir == BluetoothShare.DIRECTION_OUTBOUND) {
@@ -93,14 +96,24 @@ public class BluetoothOppTransferHistory extends Activity implements
             direction = "(" + BluetoothShare.DIRECTION + " == " + BluetoothShare.DIRECTION_OUTBOUND
                     + ")";
         } else {
-            setTitle(getText(R.string.inbound_history_title));
+            if (mShowAllIncoming) {
+                setTitle(getText(R.string.btopp_live_folder));
+            } else {
+                setTitle(getText(R.string.inbound_history_title));
+            }
             direction = "(" + BluetoothShare.DIRECTION + " == " + BluetoothShare.DIRECTION_INBOUND
                     + ")";
         }
 
-        final String selection = BluetoothShare.STATUS + " >= '200' AND " + "("
-                + BluetoothShare.VISIBILITY + " IS NULL OR " + BluetoothShare.VISIBILITY + " == '"
-                + BluetoothShare.VISIBILITY_VISIBLE + "'" + ")" + " AND " + direction;
+        String selection = BluetoothShare.STATUS + " >= '200' AND " + direction;
+
+        if (!mShowAllIncoming) {
+            selection = selection + " AND ("
+                    + BluetoothShare.VISIBILITY + " IS NULL OR "
+                    + BluetoothShare.VISIBILITY + " == '"
+                    + BluetoothShare.VISIBILITY_VISIBLE + "')";
+        }
+
         final String sortOrder = BluetoothShare.TIMESTAMP + " DESC";
 
         mTransferCursor = managedQuery(BluetoothShare.CONTENT_URI, new String[] {
@@ -127,7 +140,7 @@ public class BluetoothOppTransferHistory extends Activity implements
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
-        if (mTransferCursor != null) {
+        if (mTransferCursor != null && !mShowAllIncoming) {
             MenuInflater inflater = getMenuInflater();
             inflater.inflate(R.menu.transferhistory, menu);
         }
@@ -136,8 +149,10 @@ public class BluetoothOppTransferHistory extends Activity implements
 
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
-        boolean showClear = getClearableCount() > 0;
-        menu.findItem(R.id.transfer_menu_clear_all).setEnabled(showClear);
+        if (!mShowAllIncoming) {
+            boolean showClear = getClearableCount() > 0;
+            menu.findItem(R.id.transfer_menu_clear_all).setEnabled(showClear);
+        }
         return super.onPrepareOptionsMenu(menu);
     }
 
@@ -185,7 +200,11 @@ public class BluetoothOppTransferHistory extends Activity implements
             menu.setHeaderTitle(fileName);
 
             MenuInflater inflater = getMenuInflater();
-            inflater.inflate(R.menu.transferhistorycontextfinished, menu);
+            if (mShowAllIncoming) {
+                inflater.inflate(R.menu.receivedfilescontextfinished, menu);
+            } else {
+                inflater.inflate(R.menu.transferhistorycontextfinished, menu);
+            }
         }
     }
 
@@ -242,7 +261,7 @@ public class BluetoothOppTransferHistory extends Activity implements
      * android.widget.AdapterView.OnItemClickListener#onItemClick(android.widget
      * .AdapterView, android.view.View, int, long)
      */
-    public void onItemClick(AdapterView parent, View view, int position, long id) {
+    public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
         // Open the selected item
         mTransferCursor.moveToPosition(position);
         openCompleteTransfer();
@@ -256,8 +275,7 @@ public class BluetoothOppTransferHistory extends Activity implements
     private void openCompleteTransfer() {
         int sessionId = mTransferCursor.getInt(mIdColumnId);
         Uri contentUri = Uri.parse(BluetoothShare.CONTENT_URI + "/" + sessionId);
-        BluetoothOppTransferInfo transInfo = new BluetoothOppTransferInfo();
-        transInfo = BluetoothOppUtility.queryRecord(this, contentUri);
+        BluetoothOppTransferInfo transInfo = BluetoothOppUtility.queryRecord(this, contentUri);
         if (transInfo == null) {
             Log.e(TAG, "Error: Can not get data from db");
             return;
